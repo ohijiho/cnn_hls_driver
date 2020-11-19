@@ -73,6 +73,8 @@ typedef int XAxiCdma;
 
 #include "utils.h"
 
+#include "do_lenet.h"
+
 #define ECHO_INPUT 1
 #define TIMEOUT_MS 1000000
 #define TIMEOUT_CLOCK ((XTime)COUNTS_PER_SECOND * TIMEOUT_MS / 1000)
@@ -159,12 +161,23 @@ bool init(XNaive_matmul_top *top, XAxiCdma *cdma, XLenet1 *lenet1) {
 
 	lenet1_cfg = XLenet1_LookupConfig(XPAR_LENET1_0_DEVICE_ID);
 	if (lenet1_cfg == NULL) {
-		fprintf(stderr, "Error lenet1 LookupConfig\n");
+		fprintf(stderr, "Error lenet1_0 LookupConfig\n");
 		return false;
 	}
-	status = XLenet1_CfgInitialize(lenet1, lenet1_cfg);
+	status = XLenet1_CfgInitialize(&lenet1[0], lenet1_cfg);
 	if (status != XST_SUCCESS) {
-		fprintf(stderr, "Error initializing lenet1 core: %d\n", status);
+		fprintf(stderr, "Error initializing lenet1_0 core: %d\n", status);
+		return false;
+	}
+
+	lenet1_cfg = XLenet1_LookupConfig(XPAR_LENET1_1_DEVICE_ID);
+	if (lenet1_cfg == NULL) {
+		fprintf(stderr, "Error lenet1_1 LookupConfig\n");
+		return false;
+	}
+	status = XLenet1_CfgInitialize(&lenet1[1], lenet1_cfg);
+	if (status != XST_SUCCESS) {
+		fprintf(stderr, "Error initializing lenet1_1 core: %d\n", status);
 		return false;
 	}
 
@@ -282,15 +295,13 @@ void do_cdma(XAxiCdma *cdma, size_t n) {
 }
 #endif
 
-void do_lenet1_h(XLenet1 *lenet1, u32 base_addr_0, u32 base_addr_1);
-
 int main()
 {
     XNaive_matmul_top top;
     XAxiCdma cdma;
-    XLenet1 lenet1;
+    XLenet1 lenet1[2];
 
-	if (!init(&top, &cdma, &lenet1))
+	if (!init(&top, &cdma, lenet1))
 		return 1;
 
     for (;;) {
@@ -326,11 +337,29 @@ int main()
     		printf("%zu\n", n);
 #endif
 			do_cdma(&cdma, n);
-    	} else if (strncmp("lenet1-h", command, sizeof(command)) == 0) {
+    	} else if (strncmp("lenet1-h", command, sizeof(command)) == 0 ||
+    			strncmp("1", command, sizeof(command)) == 0) {
     		XTime start_time, end_time;
     		long t;
     		XTime_GetTime(&start_time);
-    		do_lenet1_h(&lenet1, MEM_BASE_ADDR_2, MEM_BASE_ADDR_3);
+    		do_lenet1_h(&lenet1[0], MEM_BASE_ADDR_2, MEM_BASE_ADDR_3);
+			XTime_GetTime(&end_time);
+			t = (end_time - start_time + (COUNTS_PER_SECOND / 2000)) / (COUNTS_PER_SECOND / 1000);
+			printf("%ld.%03lds\n", t / 1000, t % 1000);
+    	} else if (strncmp("lenet1-h-m", command, sizeof(command)) == 0 ||
+    			strncmp("-m", command, sizeof(command)) == 0) {
+    		XTime start_time, end_time;
+    		long t;
+    		size_t nnpus;
+    		static const u32 base_addrs[4] = {
+    				MEM_BASE_ADDR_0, MEM_BASE_ADDR_1, MEM_BASE_ADDR_2, MEM_BASE_ADDR_3
+    		};
+    		XLenet1 *const lenet1s[2] = {
+    				&lenet1[0], &lenet1[1]
+    		};
+    		scanf("%zu", &nnpus);
+    		XTime_GetTime(&start_time);
+    		do_lenet1_h_multinpu(lenet1s, base_addrs, nnpus);
 			XTime_GetTime(&end_time);
 			t = (end_time - start_time + (COUNTS_PER_SECOND / 2000)) / (COUNTS_PER_SECOND / 1000);
 			printf("%ld.%03lds\n", t / 1000, t % 1000);

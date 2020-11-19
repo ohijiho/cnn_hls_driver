@@ -19,14 +19,15 @@ typedef float w_t;
 #include "./data/test_set.h"
 #include "./data/label.h"
 
+#define N_TEST_SET 1000
+
+#include "do_lenet.h"
 #include "config.h"
 #include "utils.h"
 #include "fixed.h"
 
-typedef fixed32_8_t value_t;
-typedef struct {
-	value_t data[BATCH_SIZE];
-} minibatch_t;
+typedef lenet1_value_t value_t;
+typedef lenet1_minibatch_t minibatch_t;
 
 #define encode_value float_to_fixed32_8
 #define decode_value fixed32_8_to_float
@@ -84,7 +85,105 @@ static inline void *brk_alloc(void **brk_addr, size_t len) {
 	return ret;
 }
 
-void do_lenet1_h(XLenet1 *lenet1, u32 base_addr_0, u32 base_addr_1) {
+#define PIPE_LENGTH LENET1_PIPE_LENGTH
+
+static void (* const LENET1_SETFUNC[PIPE_LENGTH - 1][2])(XLenet1 *, u64) = {
+		{XLenet1_Set_layer1_x, XLenet1_Set_layer1_y},
+		{XLenet1_Set_layer2_x, XLenet1_Set_layer2_y},
+		{XLenet1_Set_layer3_x, XLenet1_Set_layer3_y},
+		{XLenet1_Set_layer4_x, XLenet1_Set_layer4_y},
+		{XLenet1_Set_layer5_x, XLenet1_Set_layer5_y},
+		{XLenet1_Set_layer6_x, XLenet1_Set_layer6_y},
+		{XLenet1_Set_layer7_x, XLenet1_Set_layer7_y},
+};
+
+typedef struct npu_lenet1_state npu_t;
+
+static npu_t *lenet1_select(npu_t *npus, size_t nnpus) {
+	bool driver_bottleneck = true;
+	XTime start_time;
+	XTime_GetTime(&start_time);
+	for (;;) {
+		size_t k;
+		bool end = true;
+		{
+			XTime current_time;
+			XTime_GetTime(&current_time);
+			if (current_time - start_time >= TIMEOUT_CLOCK) {
+				printf("TIMEOUT\n");
+				return NULL;
+			}
+		}
+		for (k = 0; k < nnpus; k++) {
+			npu_t *npu = &npus[k];
+			if (npu->iter < 2)
+				driver_bottleneck = false;
+			if (npu->iter < npu->iter_end + PIPE_LENGTH) {
+				end = false;
+				if (XLenet1_IsIdle(npu->lenet1)) {
+					const size_t i = npu->iter++;
+					const bool b_input = i < npu->iter_end,
+							b_lenet = i >= 1 && i < npu->iter_end + PIPE_LENGTH - 1,
+							b_output = i >= 8,
+							b_layer6 = i >= 6 && i < npu->iter_end + 6;
+					const size_t bufw = i % 2;
+					const size_t bufr = 1 - bufw;
+					size_t j;
+					if (b_lenet) {
+						for (j = 0; j < PIPE_LENGTH - 1; j++) {
+							LENET1_SETFUNC[j][0](npu->lenet1, (u32)npu->buffer[j][bufr]);
+							LENET1_SETFUNC[j][1](npu->lenet1, (u32)npu->buffer[j + 1][bufw]);
+						}
+						XLenet1_Start(npu->lenet1);
+					}
+
+					if (b_input) {
+						const size_t stage = 0;
+						encode_batch(npu->buffer[stage][bufw], npu->input, npu->bufsize[stage]);
+						Xil_DCacheFlushRange((INTPTR)npu->buffer[stage][bufw], npu->bufsize[stage] * sizeof(minibatch_t));
+					}
+
+					if (b_output) {
+						const size_t stage = PIPE_LENGTH - 1;
+						Xil_DCacheInvalidateRange((INTPTR)npu->buffer[stage][bufr], npu->bufsize[stage] * sizeof(minibatch_t));
+						decode_batch(npu->output, npu->buffer[stage][bufr], npu->bufsize[stage]);
+						npu->iter_output = i - PIPE_LENGTH;
+					}
+					npu->b_output = true;
+
+#if LAYER6_TANH_CPU
+					if (b_layer6) {
+						const size_t stage = 5;
+						const size_t len = npu->bufsize[stage];
+						const minibatch_t *xbuf = npu->buffer[stage][bufr];
+						minibatch_t *ybuf = npu->buffer[stage + 1][bufw];
+						size_t j;
+						Xil_DCacheInvalidateRange((INTPTR)xbuf, len * sizeof(minibatch_t));
+						for (j = 0; j < len; j++) {
+							size_t k;
+							for (k = 0; k < BATCH_SIZE; k++) {
+								ybuf[j].data[k] = encode_value(tanh(decode_value(xbuf[j].data[k])));
+							}
+						}
+						Xil_DCacheFlushRange((INTPTR)ybuf, len * sizeof(minibatch_t));
+					}
+#endif
+
+					if (driver_bottleneck) {
+						fprintf(stderr, "WARNING: driver bottleneck\n");
+					}
+
+					return npu;
+				}
+			}
+		}
+		driver_bottleneck = false;
+		if (end)
+			return NULL;
+	}
+}
+
+static void lenet1_h_init(npu_t *npu, XLenet1 *lenet1, u32 base_addr_0, u32 base_addr_1) {
 	value_t *weights_conv1;
 	value_t *bias_conv1;
 	value_t *weights_conv2;
@@ -94,7 +193,6 @@ void do_lenet1_h(XLenet1 *lenet1, u32 base_addr_0, u32 base_addr_1) {
 	value_t *weights_ip2;
 	value_t *bias_ip2;
 	float *input, *output;
-#define PIPE_LENGTH 8
 	minibatch_t *buffer[PIPE_LENGTH][2];
 	const size_t bufsize[PIPE_LENGTH] = {
 			1 * 28 * 28,
@@ -106,18 +204,6 @@ void do_lenet1_h(XLenet1 *lenet1, u32 base_addr_0, u32 base_addr_1) {
 			40,
 			10
 	};
-
-	void (* const setfunc[PIPE_LENGTH - 1][2])(XLenet1 *, u64) = {
-			{XLenet1_Set_layer1_x, XLenet1_Set_layer1_y},
-			{XLenet1_Set_layer2_x, XLenet1_Set_layer2_y},
-			{XLenet1_Set_layer3_x, XLenet1_Set_layer3_y},
-			{XLenet1_Set_layer4_x, XLenet1_Set_layer4_y},
-			{XLenet1_Set_layer5_x, XLenet1_Set_layer5_y},
-			{XLenet1_Set_layer6_x, XLenet1_Set_layer6_y},
-			{XLenet1_Set_layer7_x, XLenet1_Set_layer7_y},
-	};
-
-	const size_t N_TEST_SET = 1000;
 
 	{
 		void *brk_addr[2] = {(void*)base_addr_0, (void*)base_addr_1};
@@ -155,6 +241,7 @@ void do_lenet1_h(XLenet1 *lenet1, u32 base_addr_0, u32 base_addr_1) {
 	prepare_parameters(weights_conv1, bias_conv1, weights_conv2, bias_conv2, weights_ip1, bias_ip1, weights_ip2, bias_ip2);
 
 #define MAKE_SIZE2(w, h) ((u64)(w) | ((u64)(h) << 32))
+	// TODO: w, h or h, w?
 	XLenet1_Set_layer1_weight(lenet1, (u32)weights_conv1);
 	XLenet1_Set_layer1_bias(lenet1, (u32)bias_conv1);
 	XLenet1_Set_layer1_input_size(lenet1, MAKE_SIZE2(28, 28));
@@ -201,109 +288,155 @@ void do_lenet1_h(XLenet1 *lenet1, u32 base_addr_0, u32 base_addr_1) {
 	XLenet1_Set_layer7_in_features(lenet1, (u32)40);
 	XLenet1_Set_layer7_out_features(lenet1, (u32)10);
 
+#define p(x) npu->x = x;
 	{
-		size_t i, N_MINIBATCH = (N_TEST_SET - 1) / BATCH_SIZE + 1;
-		size_t correct_counter = 0;
-		for (i = 0; i < N_MINIBATCH + PIPE_LENGTH; i++) {
-			const size_t bufw = i % 2;
-			const size_t bufr = 1 - bufw;
-			const bool b_input = i < N_MINIBATCH,
-					b_lenet = i >= 1 && i < N_MINIBATCH + PIPE_LENGTH - 1,
-					b_output = i >= 8,
-					b_layer6 = i >= 6 && i < N_MINIBATCH + 6;
+		size_t i;
+		p(lenet1);
+		p(weights_conv1);
+		p(bias_conv1);
+		p(weights_conv2);
+		p(bias_conv2);
+		p(weights_ip1);
+		p(bias_ip1);
+		p(weights_ip2);
+		p(bias_ip2);
+		for (i = 0; i < PIPE_LENGTH; i++) {
+			p(buffer[i][0]);
+			p(buffer[i][1]);
+			p(bufsize[i]);
+		}
+		p(input);
+		p(output);
+		npu->iter = 0;
+		npu->iter_end = (N_TEST_SET - 1) / BATCH_SIZE + 1;
+	}
+#undef p
+}
 
-			if (b_lenet) {
-				size_t j;
-				for (j = 0; j < PIPE_LENGTH - 1; j++) {
-					setfunc[j][0](lenet1, (u32)buffer[j][bufr]);
-					setfunc[j][1](lenet1, (u32)buffer[j + 1][bufw]);
-				}
-				XLenet1_Start(lenet1);
-			}
-
-			{
-#define PRINT_CKSUM 0
-#if PRINT_CKSUM
-				size_t j, k;
-				uint32_t cksum[PIPE_LENGTH][2];
-				for (j = 0; j < PIPE_LENGTH; j++) {
-					for (k = 0; k < 2; k++) {
-						Xil_DCacheInvalidateRange((INTPTR)buffer[j][k], bufsize[j] * sizeof(minibatch_t));
-						cksum[j][k] =
-								((simple_cksum((uint32_t*)buffer[j][k], bufsize[j] * BATCH_SIZE / 2) & 0xFFFF) << 16) |
-								(simple_cksum((uint32_t*)buffer[j][k] + bufsize[j] * BATCH_SIZE / 2, (bufsize[j] * BATCH_SIZE + 1) / 2) & 0xFFFF);
-					}
-				}
-				printf("cksum: {");
-				for (j = 0; j < PIPE_LENGTH; j++) {
-					printf("{%08"PRIx32", %08"PRIx32"}, ", cksum[j][0], cksum[j][1]);
-				}
-				printf("}\n");
-#endif
-			}
-
-			if (b_input) {
-				const size_t stage = 0;
-				memcpy(input, ts + bufsize[stage] * i * BATCH_SIZE,
-						MIN(BATCH_SIZE, N_TEST_SET - i * BATCH_SIZE) * (bufsize[stage] * sizeof(float)));
-				encode_batch(buffer[stage][bufw], input, bufsize[stage]);
-				Xil_DCacheFlushRange((INTPTR)buffer[stage][bufw], bufsize[stage] * sizeof(minibatch_t));
-			}
-
-			if (b_output) {
-				const size_t stage = PIPE_LENGTH - 1;
-				size_t j, iter;
-				Xil_DCacheInvalidateRange((INTPTR)buffer[stage][bufr], bufsize[stage] * sizeof(minibatch_t));
-				decode_batch(output, buffer[stage][bufr], bufsize[stage]);
-				for (j = 0, iter = (i - (stage + 1)) * BATCH_SIZE; j < BATCH_SIZE && iter < N_TEST_SET; j++, iter++) {
-					uint32_t output_label = 0;
-					float *cur_output = output + j * bufsize[stage];
-					for (int i = 1; i < 10; i++) {
-						if (cur_output[i] > cur_output[output_label])
-							output_label = i;
-					}
-					if (ls[iter] == output_label) {
+static void lenet1_h_copy_input(npu_t *npu, size_t i) {
+	const size_t stage = 0;
+	memcpy(npu->input, ts + npu->bufsize[stage] * i * BATCH_SIZE,
+			MIN(BATCH_SIZE, N_TEST_SET - i * BATCH_SIZE) * (npu->bufsize[stage] * sizeof(float)));
+}
+static size_t lenet1_h_process_output(npu_t *npu, size_t i) {
+	const size_t stage = PIPE_LENGTH - 1;
+	size_t correct_counter = 0;
+	size_t j, iter;
+	for (j = 0, iter = i * BATCH_SIZE; j < BATCH_SIZE && iter < N_TEST_SET; j++, iter++) {
+		uint32_t output_label = 0;
+		float *cur_output = npu->output + j * npu->bufsize[stage];
+		for (int i = 1; i < 10; i++) {
+			if (cur_output[i] > cur_output[output_label])
+				output_label = i;
+		}
+		if (ls[iter] == output_label) {
 //						printf("Correct(%"PRIu32", %"PRIu32", %f)\n", output_label, ls[iter], cur_output[output_label]);
-						correct_counter++;
-					} else {
+			correct_counter++;
+		} else {
 //						printf("Incorrect(%"PRIu32", %"PRIu32", %f, %f)\n", output_label, ls[iter], cur_output[output_label], cur_output[ls[iter]]);
-					}
-				}
-			}
+		}
+	}
+	return correct_counter;
+}
 
-#if LAYER6_TANH_CPU
-			if (b_layer6) {
-				const size_t stage = 5;
-				const size_t len = bufsize[stage];
-				const minibatch_t *xbuf = buffer[stage][bufr];
-				minibatch_t *ybuf = buffer[stage + 1][bufw];
-				size_t j;
-				Xil_DCacheInvalidateRange((INTPTR)xbuf, len * sizeof(minibatch_t));
-				for (j = 0; j < bufsize[stage]; j++) {
-					size_t k;
-					for (k = 0; k < BATCH_SIZE; k++) {
-						ybuf[j].data[k] = encode_value(tanh(decode_value(xbuf[j].data[k])));
-					}
-				}
-				Xil_DCacheFlushRange((INTPTR)ybuf, len * sizeof(minibatch_t));
+void do_lenet1_h_multinpu(XLenet1 *const *lenet1s, const u32 *base_addrs, size_t nnpus) {
+	static const size_t MAX_NNPUS = 4;
+	typedef struct {
+		size_t ioff, iend;
+		size_t correct_counter;
+		size_t n_test_set;
+	} user_t;
+	user_t user_buf[MAX_NNPUS];
+	npu_t npus[MAX_NNPUS];
+	const size_t N_MINIBATCH = (N_TEST_SET - 1) / BATCH_SIZE + 1;
+	const size_t split_size = (N_MINIBATCH - 1) / nnpus + 1;
+	printf("lenet1, header data, %zu npus\n", nnpus);
+	{
+		size_t k;
+		for (k = 0; k < nnpus; k++) {
+			npu_t *npu = &npus[k];
+			user_t *user = &user_buf[k];
+			lenet1_h_init(npu, lenet1s[k], base_addrs[k * 2], base_addrs[k * 2 + 1]);
+			npu->user = user;
+			user->ioff = k * split_size;
+			user->iend = MIN(user->ioff + split_size, N_MINIBATCH);
+			user->correct_counter = 0;
+			user->n_test_set = MIN(user->iend * BATCH_SIZE, N_TEST_SET) - user->ioff * BATCH_SIZE;
+			npu->iter_end = user->iend - user->ioff;
+			lenet1_h_copy_input(npu, user->ioff);
+		}
+	}
+	{
+		npu_t *npu;
+		while ((npu = lenet1_select(npus, nnpus)) != NULL) {
+			user_t *user = (user_t*)npu->user;
+			const size_t i = user->ioff + npu->iter;
+			if (i >= user->ioff && i < user->iend) {
+				lenet1_h_copy_input(npu, i);
 			}
-#endif
-
-			if (b_lenet) {
-				XTime start_time;
-				XTime_GetTime(&start_time);
-				while (!XLenet1_IsDone(lenet1)) {
-//					printf(".");fflush(stdout);
-					XTime current_time;
-					XTime_GetTime(&current_time);
-					if (current_time - start_time >= TIMEOUT_CLOCK) {
-						printf("TIMEOUT\n");
-						break;
-					}
-				}
+			if (npu->b_output) {
+				user->correct_counter +=
+						lenet1_h_process_output(npu, user->ioff + npu->iter_output);
 			}
 		}
-//		printf("\n");
-		printf("Accuracy: %lf\n", (double)correct_counter / N_TEST_SET);
 	}
+	{
+		size_t total_correct = 0;
+		size_t k;
+		for (k = 0; k < nnpus; k++) {
+			user_t *user = (user_t*)npus[k].user;
+			total_correct += user->correct_counter;
+		}
+		printf("Accuracy: %lf\n", (double)total_correct / N_TEST_SET);
+		for (k = 0; k < nnpus; k++) {
+			user_t *user = (user_t*)npus[k].user;
+			printf(" npu%zu: %lf\n", k, (double)user->correct_counter / user->n_test_set);
+		}
+	}
+}
+
+void do_lenet1_h(XLenet1 *lenet1, u32 base_addr_0, u32 base_addr_1) {
+	npu_t npus[1];
+	size_t correct_counter = 0;
+	const size_t N_MINIBATCH = (N_TEST_SET - 1) / BATCH_SIZE + 1;
+	printf("lenet1, header data, single npu\n");
+	{
+		npu_t *npu = &npus[0];
+		lenet1_h_init(npu, lenet1, base_addr_0, base_addr_1);
+		npu->user = NULL;
+		lenet1_h_copy_input(npu, 0);
+	}
+
+	{
+		npu_t *npu;
+		while ((npu = lenet1_select(npus, 1)) != NULL) {
+			const size_t i = npu->iter;
+			if (i < N_MINIBATCH) {
+				lenet1_h_copy_input(npu, i);
+			}
+			if (npu->b_output) {
+				correct_counter +=
+						lenet1_h_process_output(npu, npu->iter_output);
+			}
+#define PRINT_CKSUM 0
+#if PRINT_CKSUM
+			size_t j, k;
+			uint32_t cksum[PIPE_LENGTH][2];
+			for (j = 0; j < PIPE_LENGTH; j++) {
+				for (k = 0; k < 2; k++) {
+					Xil_DCacheInvalidateRange((INTPTR)buffer[j][k], bufsize[j] * sizeof(minibatch_t));
+					cksum[j][k] =
+							((simple_cksum((uint32_t*)buffer[j][k], bufsize[j] * BATCH_SIZE / 2) & 0xFFFF) << 16) |
+							(simple_cksum((uint32_t*)buffer[j][k] + bufsize[j] * BATCH_SIZE / 2, (bufsize[j] * BATCH_SIZE + 1) / 2) & 0xFFFF);
+				}
+			}
+			printf("cksum: {");
+			for (j = 0; j < PIPE_LENGTH; j++) {
+				printf("{%08"PRIx32", %08"PRIx32"}, ", cksum[j][0], cksum[j][1]);
+			}
+			printf("}\n");
+#endif
+		}
+	}
+	printf("Accuracy: %lf\n", (double)correct_counter / N_TEST_SET);
 }

@@ -3,3 +3,7 @@
 /.cproject
 /Debug
 /_ide
+/bd/*/*.xdc
+/bd/*/ipshared
+/bd/*/sim
+/bd/*/synth
