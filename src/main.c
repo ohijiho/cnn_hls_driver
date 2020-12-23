@@ -159,26 +159,34 @@ bool init(XNaive_matmul_top *top, XAxiCdma *cdma, XLenet1 *lenet1) {
 	}
 #endif
 
-	lenet1_cfg = XLenet1_LookupConfig(XPAR_LENET1_0_DEVICE_ID);
-	if (lenet1_cfg == NULL) {
-		fprintf(stderr, "Error lenet1_0 LookupConfig\n");
-		return false;
-	}
-	status = XLenet1_CfgInitialize(&lenet1[0], lenet1_cfg);
-	if (status != XST_SUCCESS) {
-		fprintf(stderr, "Error initializing lenet1_0 core: %d\n", status);
-		return false;
-	}
-
-	lenet1_cfg = XLenet1_LookupConfig(XPAR_LENET1_1_DEVICE_ID);
-	if (lenet1_cfg == NULL) {
-		fprintf(stderr, "Error lenet1_1 LookupConfig\n");
-		return false;
-	}
-	status = XLenet1_CfgInitialize(&lenet1[1], lenet1_cfg);
-	if (status != XST_SUCCESS) {
-		fprintf(stderr, "Error initializing lenet1_1 core: %d\n", status);
-		return false;
+	{
+		const u16 device_ids[] = {
+#ifdef XPAR_LENET1_0_DEVICE_ID
+				XPAR_LENET1_0_DEVICE_ID,
+#endif
+#ifdef XPAR_LENET1_1_DEVICE_ID
+				XPAR_LENET1_1_DEVICE_ID,
+#endif
+#ifdef XPAR_LENET1_2_DEVICE_ID
+				XPAR_LENET1_2_DEVICE_ID,
+#endif
+#ifdef XPAR_LENET1_3_DEVICE_ID
+				XPAR_LENET1_3_DEVICE_ID,
+#endif
+		};
+		const size_t N_LENETS = sizeof(device_ids) / sizeof(u16);
+		for (size_t i = 0; i < N_LENETS; i++) {
+			lenet1_cfg = XLenet1_LookupConfig(device_ids[i]);
+			if (lenet1_cfg == NULL) {
+				fprintf(stderr, "Error lenet1_%zu LookupConfig\n", i);
+				return false;
+			}
+			status = XLenet1_CfgInitialize(&lenet1[i], lenet1_cfg);
+			if (status != XST_SUCCESS) {
+				fprintf(stderr, "Error initializing lenet1_%zu core: %d\n", i, status);
+				return false;
+			}
+		}
 	}
 
 	return true;
@@ -341,8 +349,11 @@ int main()
     			strncmp("1", command, sizeof(command)) == 0) {
     		XTime start_time, end_time;
     		long t;
+    		static const u32 base_addrs[4] = {
+    				MEM_BASE_ADDR_0, MEM_BASE_ADDR_1, MEM_BASE_ADDR_2, MEM_BASE_ADDR_3
+    		};
     		XTime_GetTime(&start_time);
-    		do_lenet1_h(&lenet1[0], MEM_BASE_ADDR_2, MEM_BASE_ADDR_3);
+    		do_lenet1_h(&lenet1[0], base_addrs);
 			XTime_GetTime(&end_time);
 			t = (end_time - start_time + (COUNTS_PER_SECOND / 2000)) / (COUNTS_PER_SECOND / 1000);
 			printf("%ld.%03lds\n", t / 1000, t % 1000);

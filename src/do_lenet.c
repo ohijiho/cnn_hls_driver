@@ -149,7 +149,20 @@ static npu_t *lenet1_select(npu_t *npus, size_t nnpus) {
 						decode_batch(npu->output, npu->buffer[stage][bufr], npu->bufsize[stage]);
 						npu->iter_output = i - PIPE_LENGTH;
 					}
-					npu->b_output = true;
+					npu->b_output = b_output;
+
+//					{
+//						if (i == 4) {
+//							const size_t stage = 3;
+//							Xil_DCacheInvalidateRange((INTPTR)npu->buffer[stage][bufr], npu->bufsize[stage] * sizeof(minibatch_t));
+//							for (j = 0; j < npu->bufsize[stage]; j++) {
+//								size_t k;
+//								for (k = 0; k < BATCH_SIZE; k++) {
+//									printf("0x%08"PRIx32"\n", npu->buffer[stage][bufr][j].data[k]);
+//								}
+//							}
+//						}
+//					}
 
 #if LAYER6_TANH_CPU
 					if (b_layer6) {
@@ -183,7 +196,9 @@ static npu_t *lenet1_select(npu_t *npus, size_t nnpus) {
 	}
 }
 
-static void lenet1_h_init(npu_t *npu, XLenet1 *lenet1, u32 base_addr_0, u32 base_addr_1) {
+static void lenet1_h_init(npu_t *npu, XLenet1 *lenet1,
+		u32 base_addrs[4],
+		const int (*alloc_regions)[2], int alloc_region_xor) {
 	value_t *weights_conv1;
 	value_t *bias_conv1;
 	value_t *weights_conv2;
@@ -206,8 +221,21 @@ static void lenet1_h_init(npu_t *npu, XLenet1 *lenet1, u32 base_addr_0, u32 base
 	};
 
 	{
-		void *brk_addr[2] = {(void*)base_addr_0, (void*)base_addr_1};
+		void *brk_addr[4];
 		size_t i;
+		for (i = 0; i < 4; i++) {
+			brk_addr[i] = (void*)base_addrs[i];
+		}
+		static const int DEFAULT_ALLOC_REGION[PIPE_LENGTH][2] = {
+				{0, 1},
+				{2, 3},
+				{0, 1},
+				{2, 3},
+				{0, 1},
+				{2, 3},
+				{0, 1},
+				{2, 3},
+		};
 #define alloc(i, len) brk_alloc(&brk_addr[i], len)
 #define alloc_value_t(i, n) ((value_t*)alloc(i, (n) * sizeof(value_t)))
 #define alloc_minibatch_t(i, n) ((minibatch_t*)alloc(i, (n) * sizeof(minibatch_t)))
@@ -215,19 +243,23 @@ static void lenet1_h_init(npu_t *npu, XLenet1 *lenet1, u32 base_addr_0, u32 base
 
 #define ALLOC_PARAMETER(i, name) \
 		name = alloc_value_t(i, sizeof(_##name) / sizeof(float))
-		ALLOC_PARAMETER(0, weights_conv1);
+		ALLOC_PARAMETER(1, weights_conv1);
 		ALLOC_PARAMETER(1, bias_conv1);
 		ALLOC_PARAMETER(1, weights_conv2);
-		ALLOC_PARAMETER(0, bias_conv2);
-		ALLOC_PARAMETER(1, weights_ip1);
+		ALLOC_PARAMETER(1, bias_conv2);
+		ALLOC_PARAMETER(0, weights_ip1);
 		ALLOC_PARAMETER(0, bias_ip1);
 		ALLOC_PARAMETER(0, weights_ip2);
-		ALLOC_PARAMETER(1, bias_ip2);
+		ALLOC_PARAMETER(0, bias_ip2);
 #undef DEFINE_PARAMETER
 
+		if (alloc_regions == NULL) {
+			alloc_regions = DEFAULT_ALLOC_REGION;
+		}
+
 		for (i = 0; i < PIPE_LENGTH; i++) {
-			buffer[i][0] = alloc_minibatch_t(0, bufsize[i]);
-			buffer[i][1] = alloc_minibatch_t(1, bufsize[i]);
+			buffer[i][0] = alloc_minibatch_t(alloc_regions[i][0] ^ alloc_region_xor, bufsize[i]);
+			buffer[i][1] = alloc_minibatch_t(alloc_regions[i][1] ^ alloc_region_xor, bufsize[i]);
 		}
 		input = alloc_float(0, BATCH_SIZE * bufsize[0]);
 		output = alloc_float(0, BATCH_SIZE * bufsize[PIPE_LENGTH - 1]);
@@ -236,6 +268,9 @@ static void lenet1_h_init(npu_t *npu, XLenet1 *lenet1, u32 base_addr_0, u32 base
 #undef alloc_value_t
 #undef alloc_minibatch_t
 #undef alloc_float
+		for (i = 0; i < 4; i++) {
+			base_addrs[i] = (u32)brk_addr[i];
+		}
 	}
 
 	prepare_parameters(weights_conv1, bias_conv1, weights_conv2, bias_conv2, weights_ip1, bias_ip1, weights_ip2, bias_ip2);
@@ -325,9 +360,9 @@ static size_t lenet1_h_process_output(npu_t *npu, size_t i) {
 	for (j = 0, iter = i * BATCH_SIZE; j < BATCH_SIZE && iter < N_TEST_SET; j++, iter++) {
 		uint32_t output_label = 0;
 		float *cur_output = npu->output + j * npu->bufsize[stage];
-		for (int i = 1; i < 10; i++) {
-			if (cur_output[i] > cur_output[output_label])
-				output_label = i;
+		for (int k = 1; k < 10; k++) {
+			if (cur_output[k] > cur_output[output_label])
+				output_label = k;
 		}
 		if (ls[iter] == output_label) {
 //						printf("Correct(%"PRIu32", %"PRIu32", %f)\n", output_label, ls[iter], cur_output[output_label]);
@@ -339,7 +374,7 @@ static size_t lenet1_h_process_output(npu_t *npu, size_t i) {
 	return correct_counter;
 }
 
-void do_lenet1_h_multinpu(XLenet1 *const *lenet1s, const u32 *base_addrs, size_t nnpus) {
+void do_lenet1_h_multinpu(XLenet1 *const *lenet1s, const u32 base_addrs[4], size_t nnpus) {
 	static const size_t MAX_NNPUS = 4;
 	typedef struct {
 		size_t ioff, iend;
@@ -352,11 +387,13 @@ void do_lenet1_h_multinpu(XLenet1 *const *lenet1s, const u32 *base_addrs, size_t
 	const size_t split_size = (N_MINIBATCH - 1) / nnpus + 1;
 	printf("lenet1, header data, %zu npus\n", nnpus);
 	{
+		u32 brk_addrs[4];
 		size_t k;
+		memcpy(brk_addrs, base_addrs, 4 * sizeof(u32));
 		for (k = 0; k < nnpus; k++) {
 			npu_t *npu = &npus[k];
 			user_t *user = &user_buf[k];
-			lenet1_h_init(npu, lenet1s[k], base_addrs[k * 2], base_addrs[k * 2 + 1]);
+			lenet1_h_init(npu, lenet1s[k], brk_addrs, NULL, k);
 			npu->user = user;
 			user->ioff = k * split_size;
 			user->iend = MIN(user->ioff + split_size, N_MINIBATCH);
@@ -395,14 +432,17 @@ void do_lenet1_h_multinpu(XLenet1 *const *lenet1s, const u32 *base_addrs, size_t
 	}
 }
 
-void do_lenet1_h(XLenet1 *lenet1, u32 base_addr_0, u32 base_addr_1) {
+void do_lenet1_h(XLenet1 *lenet1,
+		const u32 base_addrs[4]) {
 	npu_t npus[1];
 	size_t correct_counter = 0;
 	const size_t N_MINIBATCH = (N_TEST_SET - 1) / BATCH_SIZE + 1;
 	printf("lenet1, header data, single npu\n");
 	{
 		npu_t *npu = &npus[0];
-		lenet1_h_init(npu, lenet1, base_addr_0, base_addr_1);
+		u32 brk_addrs[4];
+		memcpy(brk_addrs, base_addrs, 4 * sizeof(u32));
+		lenet1_h_init(npu, lenet1, brk_addrs, NULL, 0);
 		npu->user = NULL;
 		lenet1_h_copy_input(npu, 0);
 	}
